@@ -18,7 +18,6 @@
 """Various sampling methods."""
 import functools
 import scipy.integrate as integrate
-
 import jax
 import jax.numpy as jnp
 import jax.random as random
@@ -123,6 +122,26 @@ def get_sampling_fn(config, sde, model, shape, inverse_scaler, eps):
                                  continuous=config.training.continuous,
                                  denoise=config.sampling.noise_removal,
                                  eps=eps)
+  elif sampler_name.lower() == 'metropolis':
+    predictor_warmup = get_predictor(config.sampling.predictor.lower())
+    corrector_warmup = get_corrector(config.sampling.corrector.lower())
+    #TODO have these as different correctors and predictors
+    corrector = get_corrector(config.sampling.corrector.lower()) 
+
+    sampling_fn = get_metropolis_sampler(sde=sde,
+                                 model=model,
+                                 shape=shape,
+                                 predictor_warmup=predictor_warmup,
+                                 corrector_warmup=corrector_warmup,
+                                 corrector=corrector,
+                                 inverse_scaler=inverse_scaler,
+                                 snr=config.sampling.snr,
+                                 n_steps=config.sampling.n_steps_each,n_steps_metropolis=config.sampling.n_steps_metropolis,
+                                 probability_flow=config.sampling.probability_flow,
+                                 continuous=config.training.continuous,
+                                 denoise=config.sampling.noise_removal,
+                                 eps=eps,integration_method=config.eval.integration_method,
+                                 hutchinson_type=config.eval.hutchinson)
   else:
     raise ValueError(f"Sampler name {sampler_name} unknown.")
 
@@ -296,6 +315,9 @@ class LangevinCorrector(Corrector):
 
     _, x, x_mean = jax.lax.fori_loop(0, n_steps, loop_body, (rng, x, x))
     return x, x_mean
+
+
+
 
 
 @register_corrector(name='ald')
@@ -554,3 +576,267 @@ def get_ode_sampler(sde, model, shape, inverse_scaler,
     return x, nfe
 
   return ode_sampler
+
+
+
+
+
+#### Metropolis sampling 
+
+
+
+def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup,corrector, inverse_scaler, snr,
+                   n_steps=1, probability_flow=False, continuous=False,
+                   denoise=True, eps=1e-3,integration_method='exact',hutchinson_type = 'Rademacher',n_steps_metropolis=1): 
+  """Create a metropolis sampler based on the predictor-corrector (PC) sampler.
+
+  Args:
+    sde: An `sde_lib.SDE` object representing the forward SDE.
+    model: A `flax.linen.Module` object that represents the architecture of a time-dependent score-based model.
+    shape: A sequence of integers. The expected shape of a single sample.
+    predictor_warmup: A subclass of `sampling.Predictor` representing the predictor algorithm.
+    corrector_warmup: A subclass of `sampling.Corrector` representing the corrector algorithm.
+    inverse_scaler: The inverse data normalizer.
+    snr: A `float` number. The signal-to-noise ratio for configuring correctors.
+    n_steps: An integer. The number of corrector steps per predictor update.
+    probability_flow: If `True`, solve the reverse-time probability flow ODE when running the predictor.
+    continuous: `True` indicates that the score model was continuously trained.
+    denoise: If `True`, add one-step denoising to the final samples.
+    eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
+
+  Returns:
+    A sampling function that takes random states, and a replcated training state and returns samples as well as
+    the number of function evaluations during sampling.
+  """
+  # Create predictor & corrector update functions
+  predictor_update_fn_warmpup = functools.partial(shared_predictor_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          predictor=predictor_warmup,
+                                          probability_flow=probability_flow,
+                                          continuous=continuous)
+  corrector_update_fn_warmup = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          corrector=corrector_warmup,
+                                          continuous=continuous,
+                                          snr=snr,
+                                          n_steps=n_steps)
+  
+  corrector_update_fn_metropolis = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          corrector=corrector,
+                                          continuous=continuous,
+                                          snr=snr,
+                                          n_steps=n_steps_metropolis)
+  #this is different at the moment because in future we will have other distributions
+
+  def metropolis_sampler(rng, state):
+    """ The PC sampler funciton.
+
+    Args:
+      rng: A JAX random state
+      state: A `flax.struct.dataclass` object that represents the training state of a score-based model.
+    Returns:
+      Samples, number of function evaluations
+    """
+    #likelihood terms
+    def drift_fn(state, x, t):
+      """The drift function of the reverse-time SDE."""
+      score_fn = mutils.get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
+      # Probability flow ODE is a special case of Reverse SDE
+      rsde = sde.reverse(score_fn, probability_flow=True)
+
+      return (rsde.sde)(x, t)[0]
+
+    if(integration_method=='estimate'):
+      #@jax.pmap
+      def div_fn(state, x, t, eps):
+        """Pmapped divergence of the drift function."""
+        div_fn = get_div_fn(lambda x, t: drift_fn(state, x, t))
+        return div_fn(x, t, eps)
+    elif(integration_method=='exact'):
+      #@jax.pmap
+      def div_fn(state, x, t,eps):
+        """Pmapped divergence of the drift function."""
+        div_fn = get_div_fn_exact(lambda x, t: drift_fn(state, x, t))
+        return div_fn(x, t, eps)
+    else:
+      raise NotImplementedError(f"Method of integration {integration_method} unknown.")     
+
+    #p_drift_fn = jax.pmap(drift_fn)  # Pmapped drift function of the reverse-time SDE
+    #p_prior_logp_fn = jax.pmap(sde.prior_logp)  # Pmapped log-PDF of the SDE's prior distribution
+      
+
+
+    
+    # Initial sample
+    rng, step_rng = random.split(rng)
+    x = sde.prior_sampling(step_rng, shape)
+    timesteps = jnp.linspace(sde.T, eps, sde.N)
+
+
+
+
+
+    #warmup stage
+    def loop_body_warmup(i, val):
+      rng, x, x_mean = val
+      t = timesteps[i]
+      vec_t = jnp.ones(shape[0]) * t
+      rng, step_rng = random.split(rng)
+      x, x_mean = corrector_update_fn_warmup(step_rng, state, x, vec_t)
+      rng, step_rng = random.split(rng)
+      x, x_mean = predictor_update_fn_warmpup(step_rng, state, x, vec_t)
+      return rng, x, x_mean
+
+    rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_warmup, (rng, x, x))
+    t=eps
+    # Denoising is equivalent to running one predictor step without adding noise.
+    #r
+    rng, step_rng = jax.random.split((rng))
+    if hutchinson_type == 'Gaussian':
+      epsilon = jax.random.normal(step_rng, shape)
+    elif hutchinson_type == 'Rademacher':
+      epsilon = jax.random.randint(step_rng, shape,
+                                 minval=0, maxval=2).astype(jnp.float32) * 2 - 1
+    else:
+      raise NotImplementedError(f"Hutchinson type {hutchinson_type} unknown.")
+    solver = diffrax.Tsit5()  # Equivalent to RK45
+
+
+
+
+    shape_vmap=(1,shape[1])
+    def ode_func(t, x,args):
+
+      # x should be shape (n_dims,)
+      # t should be shape ()
+      sample = x.reshape(shape_vmap)
+      vec_t = jnp.ones(shape_vmap[0]) * t
+      drift = drift_fn(state, sample, vec_t)
+
+ 
+      drift = mutils.to_flattened_numpy(drift_fn(state, sample, vec_t))
+      logp_grad = mutils.to_flattened_numpy(div_fn(state, sample, vec_t, epsilon))
+
+      zp = jnp.concatenate([drift, logp_grad], axis=0)
+      z = mutils.from_flattened_numpy(drift, shape_vmap)
+      delta_logp = logp_grad.sum()
+      prior_logp = (sde.prior_logp)(z)
+      l_hood_new = -(prior_logp + delta_logp)-jnp.log(sde.marginal_prob(jnp.zeros_like(x), vec_t)[1]) 
+      return jnp.concatenate([l_hood_new,l_hood_new],axis=0)  
+    
+
+    v_t = jnp.ones(shape[0]) * t
+
+    def loop_body_metropolis(i, val):
+      # so what i need too do in this is to check the code for the noise and for the metropolis sampling particualrly for t
+      rng, x, x_mean, vec_t, l_hood = val
+      assert vec_t.shape[0]==shape[0]
+      v_t_new=vec_t#NOISE_NET(x) # gibbs sampling t~q(t|x)
+      rng, step_rng = random.split(rng)
+
+      x_new, x_mean_new = corrector_update_fn_metropolis(step_rng, state, x, v_t_new)
+
+      rng, step_rng = random.split(rng)
+      def solve_ode(inputs):
+        t1, x_batch = inputs[0], inputs[1:]
+
+        init = mutils.to_flattened_numpy(x_batch)
+
+        #init is the concatenated x and the zeros
+        
+        t0=sde.T
+        dt0 = t1 - sde.T # Automatic initial step size
+        saveat = diffrax.SaveAt(ts=[t1])  # Save only final time 
+        term=diffrax.ODETerm(ode_func)
+        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-5)
+        solution = diffrax.diffeqsolve(
+          term,
+          solver,
+          t0=t0,
+          t1=t1,
+          dt0=dt0,
+          y0=init,
+          saveat=saveat,
+          stepsize_controller=stepsize_controller
+        )
+
+        return solution.ys[0]
+      # Extract results
+      batch_size = shape[0]
+      t0 = sde.T*jnp.ones(shape[0])
+      t1 = v_t_new
+      batched_solve = jax.vmap(solve_ode)
+      inputs=jnp.concatenate([t1.reshape(-1,1),x_new],axis=1)
+      solutions = batched_solve(inputs)
+      l_hood_new = jnp.asarray(solutions)[:,0]
+
+
+      
+      # Metropolis acceptance
+      accept = jnp.exp(l_hood_new - l_hood)
+      rng, step_rng = random.split(rng)
+      u = random.uniform(step_rng, (shape[0],))
+      mask = u < accept
+      x_new = jnp.where(mask[:, None], x_new, x)
+      x_mean_new=jnp.where(mask[:, None], x_mean_new, x_mean)
+      l_hood = jnp.where(mask, l_hood_new, l_hood)
+      vec_t = jnp.where(mask, v_t_new, vec_t)
+
+
+
+      return rng, x_new, x_mean_new, vec_t, l_hood
+    n_samples=10
+    rng, x, x_old_mean, vec_t,l_hood= jax.lax.fori_loop(0, n_samples, loop_body_metropolis, (rng, x, x_mean, v_t, jnp.ones(shape[0])*1e-10))
+    
+
+    timesteps = jax.vmap(lambda t: jnp.linspace(t, eps, sde.N // 100))(vec_t).T
+    #warmup stage
+    def loop_body_final(i, val):
+      rng, x, x_mean = val
+      vec_t = timesteps[i] #this needs to be made a vector!
+
+      rng, step_rng = random.split(rng)
+      x, x_mean = predictor_update_fn_warmpup(step_rng, state, x, vec_t) # use the same predictor
+      return rng, x, x_mean
+    # Metropolis sampling
+    rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_final, (rng, x, x_old_mean))
+    # final t=eps
+    return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
+
+  return jax.pmap(metropolis_sampler, axis_name='batch')
+
+
+
+
+
+
+
+
+
+
+
+##################
+#### utils for the metropolis
+
+def get_div_fn(fn):
+  """Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator."""
+  ## Forward-mode differentiation (faster)
+  def div_fn(x, t, eps):
+      jvp = jax.jvp(lambda x: fn(x, t), (x,), (eps,))[1]
+      return jnp.sum(jvp * eps, axis=tuple(range(1, len(x.shape))))
+
+  return div_fn
+
+def get_div_fn_exact(fn):
+    """Create the exact divergence function of `fn`, where `fn: R^n -> R^n`."""   
+    def div_fn(x, t,eps=None):
+
+        # Compute per-sample Jacobian, ensuring differentiation is only w.r.t x
+        jacobian = jax.vmap(jax.jacfwd(fn,argnums=0))(x, t[:,None])  # Differentiate w.r.t. x only
+        return jnp.trace(jacobian, axis1=-2, axis2=-1)  # Take trace over last two axes
+
+    return div_fn

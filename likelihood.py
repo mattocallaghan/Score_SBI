@@ -41,9 +41,21 @@ def get_div_fn(fn):
 
     return div_fn
 
+def get_div_fn_exact(fn):
+    """Create the exact divergence function of `fn`, where `fn: R^n -> R^n`."""
+    
+    def div_fn(x, t,eps=None):
+
+        # Compute per-sample Jacobian, ensuring differentiation is only w.r.t x
+        jacobian = jax.vmap(jax.jacfwd(fn,argnums=0))(x, t[:,None])  # Differentiate w.r.t. x only
+
+        return jnp.trace(jacobian, axis1=-2, axis2=-1)  # Take trace over last two axes
+
+    return div_fn
+
 
 def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
-                      rtol=1e-5, atol=1e-5, method='RK45', eps=1e-5):
+                      rtol=1e-5, atol=1e-5, method='RK45', eps=1e-5,how='estimate'):
   """Create a function to compute the unbiased log-likelihood estimate of a given data point.
 
   Args:
@@ -70,11 +82,21 @@ def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
     rsde = sde.reverse(score_fn, probability_flow=True)
     return rsde.sde(x, t)[0]
 
-  @jax.pmap
-  def p_div_fn(state, x, t, eps):
-    """Pmapped divergence of the drift function."""
-    div_fn = get_div_fn(lambda x, t: drift_fn(state, x, t))
-    return div_fn(x, t, eps)
+  if(how=='estimate'):
+    @jax.pmap
+    def p_div_fn(state, x, t, eps):
+      """Pmapped divergence of the drift function."""
+      div_fn = get_div_fn(lambda x, t: drift_fn(state, x, t))
+      return div_fn(x, t, eps)
+  elif(how=='exact'):
+    @jax.pmap
+    def p_div_fn(state, x, t,eps):
+      """Pmapped divergence of the drift function."""
+      div_fn = get_div_fn_exact(lambda x, t: drift_fn(state, x, t))
+      return div_fn(x, t, eps)
+  else:
+    raise NotImplementedError(f"Method of integration {how} unknown.")
+
 
   p_drift_fn = jax.pmap(drift_fn)  # Pmapped drift function of the reverse-time SDE
   p_prior_logp_fn = jax.pmap(sde.prior_logp)  # Pmapped log-PDF of the SDE's prior distribution
@@ -99,9 +121,10 @@ def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
       epsilon = jax.random.normal(step_rng, shape)
     elif hutchinson_type == 'Rademacher':
       epsilon = jax.random.randint(step_rng, shape,
-                                   minval=0, maxval=2).astype(jnp.float32) * 2 - 1
+                                 minval=0, maxval=2).astype(jnp.float32) * 2 - 1
     else:
       raise NotImplementedError(f"Hutchinson type {hutchinson_type} unknown.")
+
 
     def ode_func(t, x,args):
       sample = mutils.from_flattened_numpy(x[:-shape[0] * shape[1]], shape)
@@ -109,6 +132,7 @@ def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
       drift = mutils.to_flattened_numpy(p_drift_fn(pstate, sample, vec_t))
       logp_grad = mutils.to_flattened_numpy(p_div_fn(pstate, sample, vec_t, epsilon))
       return jnp.concatenate([drift, logp_grad], axis=0)
+
 
 
     init = jnp.concatenate([mutils.to_flattened_numpy(data), np.zeros((shape[0] * shape[1],))], axis=0)

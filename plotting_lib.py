@@ -100,7 +100,8 @@ def score_plot(config, workdir, eval_folder="eval"):
 
 
   if True:
-    likelihood_fn = likelihood.get_likelihood_fn(sde, score_model, inverse_scaler)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
+    likelihood_fn = likelihood.get_likelihood_fn(sde, score_model, inverse_scaler
+                                                 ,how=config.eval.integration_method,hutchinson_type=config.eval.hutchinson)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
 
   # Build the sampling function.
 
@@ -174,8 +175,7 @@ def score_plot(config, workdir, eval_folder="eval"):
             return score_model.apply(variables, x, labels, train=False, mutable=False)
           p_score_foward= jax.pmap(score_forward)
 
-          grd = p_score_foward(eval_batch['joint_data'], 1e-3 * jnp.ones(eval_batch['joint_data'].shape[:-1]),pstate)
-          print(grd.shape)
+          grd = jnp.stack([p_score_foward(eval_batch['joint_data'], epsilon * jnp.ones(eval_batch['joint_data'].shape[:-1]),pstate) for epsilon in np.linspace(config.model.sigma_min,config.model.sigma_max,4)],axis=-1)
           bpds.extend(bpd.T)
           ds.extend(batch['joint_data']._numpy().reshape(-1,batch['joint_data']._numpy().shape[-1]))
           gradients.extend(grd)
@@ -230,49 +230,64 @@ def score_plot(config, workdir, eval_folder="eval"):
       likelihood_samples = [np.load(fp)[np.load(fp).files[0]] for fp in file_paths_likelihood[0:]]
       stacked_likelihood = np.vstack(likelihood_samples).flatten()
       gradients_samples = [np.load(fp)[np.load(fp).files[0]] for fp in file_paths_gradients[0:]]
-      stacked_gradients = np.vstack(gradients_samples).reshape(-1, config.data.vector_dim)
 
       # Example data
       x = stacked_data[:, 0]
       y = stacked_data[:, 1]
       z = stacked_likelihood
 
-            # Create grid values first.
-      grad_magnitude = np.linalg.norm(stacked_gradients, axis=-1)
-
-      # Clip gradient magnitudes to avoid outliers
-      clip_percentile = 95  # Clip anything above the 95th percentile
-      max_grad = np.percentile(grad_magnitude, clip_percentile)
-
-# Normalize gradients with clipping
-      grad_magnitude = np.clip(grad_magnitude, 0, max_grad)
-      u = stacked_gradients[:, 0] / grad_magnitude
-      v = stacked_gradients[:, 1] / grad_magnitude
-
-      # Create grid values
-      xi = np.linspace(x.min(), x.max(), 100)
-      yi = np.linspace(y.min(), y.max(), 100)
-      xi, yi = np.meshgrid(xi, yi)
-
-      # Interpolate likelihood values
-      zi = griddata((x, y), z, (xi, yi), method='cubic')
+      # Create grid values first.
 
       # Plot
-      plt.figure(figsize=(8, 6))
+      fig, axs = plt.subplots(2, 3, figsize=(18, 12))
 
-      # Contour plot
-      plt.contourf(xi, yi, zi, levels=15, cmap='viridis')
-      plt.colorbar(label='Likelihood')
+      # Scatter plot
+      scatter = axs[0, 0].scatter(x, y, c=z, cmap='viridis', marker='o')
+      fig.colorbar(scatter, ax=axs[0, 0], label='Likelihood')
+      axs[0, 0].set_title('Original Data Likelihood')
+      axs[0, 0].set_xlabel('X')
+      axs[0, 0].set_ylabel('Y')
+      axs[0, 0].grid(True)
 
-      # Quiver plot with better scaling
-      plt.quiver(x, y, u, v, color='white', scale=20, width=0.002, alpha=0.8)
+      # Quiver plots for each epsilon value
+      epsilons = np.linspace(config.model.sigma_min,config.model.sigma_max,4)
+      for i, epsilon in enumerate(epsilons):
+        gradients_samples_temp = [grad_s[:,:,:,i] for grad_s in gradients_samples]
 
-      plt.title('Smooth Interpolated Plot with Gradients')
-      plt.xlabel('X')
-      plt.ylabel('Y')
-      plt.grid(True)
+        stacked_gradients = np.vstack(gradients_samples_temp).reshape(-1, config.data.vector_dim)#*epsilon
+        
+        grad_magnitude = np.linalg.norm(stacked_gradients, axis=-1)
+        #grad_magnitude=50
+        # Clip gradient magnitudes to avoid outliers
+        clip_percentile = 100  # Clip anything above the 99th percentile
+        max_grad = np.percentile(grad_magnitude, clip_percentile)
+
+        # Normalize gradients with clipping
+        grad_magnitude = np.clip(grad_magnitude, 0, max_grad)
+        u = stacked_gradients[:, 0]/grad_magnitude
+        v = stacked_gradients[:, 1]/grad_magnitude
+        row = (i + 1) // 3
+        col = (i + 1) % 3
+        # Quiver plot for gradients
+        axs[row, col].quiver(x, y, u, v, color='black', scale=30, width=0.002, alpha=0.8)
+        max_grad_idx = np.argmax(grad_magnitude)
+        axs[row, col].set_title(f'Grads $\\sigma$={epsilon:.2f}, Max Grad: {grad_magnitude[max_grad_idx]:.2f}')
+        axs[row, col].set_xlabel('X')
+        axs[row, col].set_ylabel('Y')
+        axs[row, col].grid(True)
+
+        # Plot the magnitude of maximum gradient
+        
+        # Mark the point with maximum gradient
+        
+        axs[row, col].set_xlabel('X')
+        axs[row, col].set_ylabel('Y')
+        axs[row, col].grid(True)
+
+      # Hide the unused subplot
+      axs[1, 2].axis('off')
 
       # Save the plot
       plt.savefig(os.path.join(eval_dir,
-          f"{config.eval.bpd_dataset}_ckpt_{ckpt}_likelihood_plot.png"), dpi=300)
+        f"{config.eval.bpd_dataset}_ckpt_{ckpt}_likelihood_gradients_plot.png"), dpi=300)
       plt.close()

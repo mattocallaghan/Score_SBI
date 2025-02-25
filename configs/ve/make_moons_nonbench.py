@@ -1,6 +1,10 @@
 from configs.default_sbi_configs import get_config as base_get_config
 import ml_collections
 
+"""
+The main condition is for the scaling by sigma, so we dont condition but we do scale by sigma
+"""
+
 def get_config():
     # Start with the base configuration.
     config = base_get_config()
@@ -10,7 +14,7 @@ def get_config():
     config.model.nf = 4
     config.model.dropout=0.00
     # Whether to condition on the noise level/time (set to True for a conditional score model).
-    config.model.conditional = True  
+    config.model.conditional = False  
     # The hidden layer size in the network.
     config.model.hidden_size = 250  
     # The number of fully-connected layers (excluding the output layer).
@@ -36,8 +40,12 @@ def get_config():
     config.eval.begin_ckpt = 20                  # Starting checkpoint index.
     config.eval.end_ckpt = 20
     config.eval.grid_points=100
+    config.eval.batch_size=10000
+    config.eval.num_samples=10000 #this doesnt seem to work without this 
+    config.eval.integration_method='exact'
+    config.eval.hutchinson='Rademacher'   #need to prepegate this
 
-    config.sampling.method = 'pc'
+    config.sampling.method = 'metropolis'              # Options: 'ode' or 'pc' (predictor-corrector).
     config.optim.weight_decay = 1e-3
 
 

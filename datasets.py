@@ -293,7 +293,7 @@ def load_custom_dataset_plotting(dataset_name, config):
     # Generate uniform data within the specified bounds
     #data = np.random.uniform(low=-bound, high=bound, size=(100000, dimension))
     # Generate meshgrid data within the specified bounds
-    grid_points = np.linspace(-bound/3-1, bound/3+1, int((grid_point)))
+    grid_points = np.linspace(-2, 2, int((grid_point)))
     mesh = np.meshgrid(*[grid_points,] * dimension)
     data = np.stack([mesh[_].flatten() for _ in range(len(mesh))],-1)
 

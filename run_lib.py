@@ -5,6 +5,7 @@ import gc
 import io
 import os
 import time
+import equinox
 from typing import Any
 import matplotlib.pyplot as plt
 import math
@@ -320,7 +321,8 @@ def evaluate(config, workdir, eval_folder="eval"):
 
 
   if config.eval.enable_bpd:
-    likelihood_fn = likelihood.get_likelihood_fn(sde, score_model, inverse_scaler)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
+    likelihood_fn = likelihood.get_likelihood_fn(sde, score_model, inverse_scaler
+                                                 ,how=config.eval.integration_method,hutchinson_type=config.eval.hutchinson)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
 
   # Build the sampling function.
   if config.eval.enable_sampling:
@@ -355,7 +357,7 @@ def evaluate(config, workdir, eval_folder="eval"):
     begin_bpd_round = num_bpd_rounds
     begin_sampling_round = eval_meta.sampling_round_id + 1
   else:
-    begin_ckpt = eval_meta.ckpt_id + 1
+    begin_ckpt = eval_meta.ckpt_id #+ 1
     begin_bpd_round = 0
     begin_sampling_round = 0
 
@@ -443,12 +445,15 @@ def evaluate(config, workdir, eval_folder="eval"):
     else:
       # Skip likelihood computation and save intermediate states for pre-emption
       eval_meta = eval_meta.replace(ckpt_id=ckpt, bpd_round_id=num_bpd_rounds - 1)
-      checkpoints.save_checkpoint(
-        eval_dir,
-        eval_meta,
-        step=ckpt * (num_sampling_rounds + num_bpd_rounds) + num_bpd_rounds - 1,
-        keep=1,
-        prefix=f"meta_{jax.host_id()}_")
+      try:
+        checkpoints.save_checkpoint(
+          eval_dir,
+          eval_meta,
+          step=ckpt * (num_sampling_rounds + num_bpd_rounds) + num_bpd_rounds - 1,
+          keep=1,
+          prefix=f"meta_{jax.host_id()}_")
+      except Exception as e:
+        print(f"An error occurred while saving the checkpoint: {e}")
       
 
 
@@ -459,14 +464,16 @@ def evaluate(config, workdir, eval_folder="eval"):
       for r in range(begin_sampling_round, num_sampling_rounds):
         if jax.host_id() == 0:
           logging.info("sampling -- ckpt: %d, round: %d" % (ckpt, r))
-
         rng, *sample_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
         sample_rng = jnp.asarray(sample_rng)
-        samples, _ = sampling_fn(sample_rng, pstate)
+        samples, _ = equinox.filter_jit(sampling_fn)(sample_rng, pstate)
         # Save raw vector samples.
         this_sample_dir = os.path.join(
           eval_dir, f"ckpt_{ckpt}_host_{jax.host_id()}")
         tf.io.gfile.makedirs(this_sample_dir)
+        logging.info("Warning Clearning Backend!")
+        jax.clear_backends()
+
 
 
         sample_save_path = os.path.join(this_sample_dir, f"samples_{r}.npz")
@@ -476,15 +483,26 @@ def evaluate(config, workdir, eval_folder="eval"):
           fout.write(io_buffer.getvalue())
         gc.collect()
         logging.info("Checkpoint %d: saved sampling round %d." % (ckpt, r))
+
+        def clear_memory(x):
+          del x
+          return None
+
+        samples = jax.tree_map(clear_memory, samples)
+
+
+
         # Update meta state.
         eval_meta = eval_meta.replace(ckpt_id=ckpt, sampling_round_id=r, rng=rng)
-        if r < num_sampling_rounds - 1:
+        try:
           checkpoints.save_checkpoint(
             eval_dir,
             eval_meta,
             step=ckpt * (num_sampling_rounds + num_bpd_rounds) + r + num_bpd_rounds,
             keep=1,
             prefix=f"meta_{jax.host_id()}_")
+        except Exception as e:
+          print(f"An error occurred while saving the checkpoint: {e}")
     else:
       # Skip sampling and save intermediate evaluation states for pre-emption
       eval_meta = eval_meta.replace(ckpt_id=ckpt, sampling_round_id=num_sampling_rounds - 1, rng=rng)

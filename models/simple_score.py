@@ -15,6 +15,10 @@ class SimpleScoreNet(nn.Module):
 
     @nn.compact
     def __call__(self, x, time_cond, train=True):
+        """
+        while this says time condition herre, in reality it is the noise level as when called to the
+        score function we pass through to get sigmas first
+        """
 
         config = self.config
         dropout = config.model.dropout
@@ -29,7 +33,6 @@ class SimpleScoreNet(nn.Module):
         # time_cond: continuous time values, shape (batch,) or (batch, 1)
         if time_cond.ndim == 1:
             time_cond = time_cond[:, None]
-
         # Configuration parameters.
         hidden_size = config.model.hidden_size  
         num_layers = config.model.num_layers   
@@ -43,6 +46,7 @@ class SimpleScoreNet(nn.Module):
         # Optionally, further process the embedding with a Dense layer.
         if(conditional):
             if(config.model.embedding_type == 'fourier'):
+                used_sigmas=time_cond
                 time_emb = GaussianFourierProjection(
                             embedding_size=nf, scale=fourier_scale)(jnp.log(time_cond))
             elif config.model.embedding_type == 'positional':
@@ -52,11 +56,15 @@ class SimpleScoreNet(nn.Module):
             else:
                 raise ValueError(f'Unknown embedding type {config.model.embedding_type}.')
 
- 
+        else:
+            time_emb=None
+            used_sigmas=time_cond
+            
+
             
         h=x
         for i in range(num_layers - 1):
-            h = nn.Dense(hidden_size, name=f'hidden_dense_{i}',use_bias=False)(h)
+            h = nn.Dense(hidden_size, name=f'hidden_dense_{i}',use_bias=True)(h)
             h = nn.Dropout(dropout)(h, deterministic=not train)
             h = act(h)
             if(conditional):
@@ -65,10 +73,9 @@ class SimpleScoreNet(nn.Module):
                 h+=time_emb
 
 
-        out = nn.Dense(x.shape[-1],name='output_dense',use_bias=False)(h)
+        out = nn.Dense(x.shape[-1],name='output_dense',use_bias=True)(h)
         if config.model.scale_by_sigma:
-            out=out/time_cond.reshape(-1,1)
-
+            out=out/used_sigmas.reshape(-1,1)
         return out
 
 
