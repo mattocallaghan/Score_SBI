@@ -21,10 +21,11 @@ import scipy.integrate as integrate
 import jax
 import jax.numpy as jnp
 import jax.random as random
+import equinox
 import abc
 import flax
 import diffrax
-
+import equinox as eqx
 from models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
 import sde_lib
 from utils import batch_mul, batch_add
@@ -122,26 +123,7 @@ def get_sampling_fn(config, sde, model, shape, inverse_scaler, eps):
                                  continuous=config.training.continuous,
                                  denoise=config.sampling.noise_removal,
                                  eps=eps)
-  elif sampler_name.lower() == 'metropolis':
-    predictor_warmup = get_predictor(config.sampling.predictor.lower())
-    corrector_warmup = get_corrector(config.sampling.corrector.lower())
-    #TODO have these as different correctors and predictors
-    corrector = get_corrector(config.sampling.corrector.lower()) 
 
-    sampling_fn = get_metropolis_sampler(sde=sde,
-                                 model=model,
-                                 shape=shape,
-                                 predictor_warmup=predictor_warmup,
-                                 corrector_warmup=corrector_warmup,
-                                 corrector=corrector,
-                                 inverse_scaler=inverse_scaler,
-                                 snr=config.sampling.snr,
-                                 n_steps=config.sampling.n_steps_each,n_steps_metropolis=config.sampling.n_steps_metropolis,
-                                 probability_flow=config.sampling.probability_flow,
-                                 continuous=config.training.continuous,
-                                 denoise=config.sampling.noise_removal,
-                                 eps=eps,integration_method=config.eval.integration_method,
-                                 hutchinson_type=config.eval.hutchinson)
   else:
     raise ValueError(f"Sampler name {sampler_name} unknown.")
 
@@ -315,6 +297,146 @@ class LangevinCorrector(Corrector):
 
     _, x, x_mean = jax.lax.fori_loop(0, n_steps, loop_body, (rng, x, x))
     return x, x_mean
+
+
+
+
+
+@register_corrector(name='langevin_time_exact')
+class LangevinCorrectorTimeExact(Corrector):
+  def __init__(self, sde, score_fn, snr, n_steps):
+    super().__init__(sde, score_fn, snr, n_steps)
+    if not isinstance(sde, sde_lib.VPSDE) \
+        and not isinstance(sde, sde_lib.VESDE) \
+        and not isinstance(sde, sde_lib.subVPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+#assumes a sigma prior of 1/sigma
+  def update_fn(self, rng, x, t):
+    sde = self.sde
+    score_fn = self.score_fn
+    n_steps = self.n_steps
+    target_snr = self.snr
+    rsde = sde.reverse(score_fn, probability_flow=True)
+    drift_fn = lambda X, T: (rsde.sde)(X,T)[0]
+    sigma_t = lambda T: sde.marginal_prob(jnp.zeros_like(x), jnp.ones(x.shape[0]) * T)[1]
+    grad_sigma_t = (jax.grad(lambda T: sde.marginal_prob(1.0, T)[1]))
+
+    
+
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).astype(jnp.int32)
+      alpha = sde.alphas[timestep]
+    else:
+      alpha = jnp.ones_like(t)
+
+    def loop_body(step, val):
+      rng, x, x_mean,t_in,t_in_mean = val
+      grad = score_fn(x, t_in)
+
+      
+      jacobian = jax.vmap(jax.jacfwd(drift_fn,argnums=0))(x, t_in[:,None])  # Differentiate w.r.t. x only
+
+      
+
+      if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+        #quite an unstable calculation for vesde
+        dsigma_dt=jax.vmap(grad_sigma_t)(t_in)[:,None]
+        d2sigma_dt2 = jax.vmap(jax.jacfwd(lambda T: grad_sigma_t(T)))(t_in)[:,None]
+        dt = jnp.diagonal(jacobian, axis1=-2, axis2=-1).sum(-1) - (1.0 / sigma_t(t_in))[:,None] * dsigma_dt +   d2sigma_dt2/jnp.abs(dsigma_dt)
+      else:
+        dsigma_dt=jax.vmap(grad_sigma_t)(t_in)[:,None]
+        dt =-jnp.diagonal(jacobian, axis1=-2, axis2=-1).sum(-1)#-1e3*dsigma_dt
+      grad_xt=jnp.concatenate([grad,dt],axis=-1)
+      rng, step_rng = jax.random.split(rng)
+      noise = jax.random.normal(step_rng, grad_xt.shape)
+      grad_norm = jnp.linalg.norm(
+        grad_xt.reshape((grad_xt.shape[0], -1)), axis=-1).mean()
+      grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
+      noise_norm = jnp.linalg.norm(
+        noise.reshape((noise.shape[0], -1)), axis=-1).mean()
+      noise_norm = jax.lax.pmean(noise_norm, axis_name='batch')
+      step_size = (target_snr * noise_norm / grad_norm) ** 2 * 2 * alpha
+      
+      xt=jnp.concatenate([x,t_in[:,None]],axis=-1)
+      xt_mean = xt + batch_mul(step_size, grad_xt)
+      xt = xt_mean + batch_mul(noise, jnp.sqrt(step_size * 2))
+      return rng, xt[:,:-1], xt_mean[:,:-1],xt[:,-1],xt_mean[:,-1]
+
+    _, x, x_mean,t,t_mean = jax.lax.fori_loop(0, n_steps, loop_body, (rng, x, x,t,t))
+    return x, x_mean,t,t_mean
+
+
+
+
+@register_corrector(name='langevin_time_approx')
+class LangevinCorrectorTimeApprox(Corrector):
+  def __init__(self, sde, score_fn, snr, n_steps):
+    super().__init__(sde, score_fn, snr, n_steps)
+    if not isinstance(sde, sde_lib.VPSDE) \
+        and not isinstance(sde, sde_lib.VESDE) \
+        and not isinstance(sde, sde_lib.subVPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+#assumes a sigma prior of 1/sigma
+  def update_fn(self, rng, x, t):
+    sde = self.sde
+    score_fn = self.score_fn
+    n_steps = self.n_steps
+    target_snr = self.snr
+    rsde = sde.reverse(score_fn, probability_flow=True)
+    drift_fn = lambda X, T: (rsde.sde)(X,T)[0]
+    sigma_t = lambda T: sde.marginal_prob(jnp.zeros_like(x), jnp.ones(x.shape[0]) * T)[1]
+    grad_sigma_t = (jax.grad(lambda T: sde.marginal_prob(1.0, T)[1]))
+
+
+
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).astype(jnp.int32)
+      alpha = sde.alphas[timestep]
+    else:
+      alpha = jnp.ones_like(t)
+
+    def loop_body(step, val):
+      rng, x, x_mean,t_in,t_in_mean = val
+      grad = score_fn(x, t_in)
+
+      rng, step_rng = random.split(rng)
+      eps = jax.random.randint(step_rng, x.shape,                       
+                                                   minval=0, maxval=2).astype(jnp.float32) * 2 - 1
+
+      jvp = jax.jvp(lambda x: drift_fn(x,t_in[:,None]), (x,), (eps,))[1]
+
+      if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+        #quite an unstable calculation for vesde
+        dsigma_dt=jax.vmap(grad_sigma_t)(t_in)[:,None]
+        d2sigma_dt2 = jax.vmap(jax.jacfwd(lambda T: grad_sigma_t(T)))(t_in)[:,None]
+        dt = -jnp.sum(jvp * eps, axis=tuple(range(1, len(x.shape))))[:,None] - (1.0 / sigma_t(t_in))[:,None] * dsigma_dt +   d2sigma_dt2/jnp.abs(dsigma_dt)
+      else:
+        dsigma_dt=jax.vmap(grad_sigma_t)(t_in)[:,None]
+        dt =-jnp.sum(jvp * eps, axis=tuple(range(1, len(x.shape))))[:,None]#-1e3*dsigma_dt
+      grad_xt=jnp.concatenate([grad,dt],axis=-1)
+      rng, step_rng = jax.random.split(rng)
+      noise = jax.random.normal(step_rng, grad_xt.shape)
+      grad_norm = jnp.linalg.norm(
+        grad_xt.reshape((grad_xt.shape[0], -1)), axis=-1).mean()
+      grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
+      noise_norm = jnp.linalg.norm(
+        noise.reshape((noise.shape[0], -1)), axis=-1).mean()
+      noise_norm = jax.lax.pmean(noise_norm, axis_name='batch')
+      step_size = (target_snr * noise_norm / grad_norm) ** 2 * 2 * alpha
+      
+      xt=jnp.concatenate([x,t_in[:,None]],axis=-1)
+      xt_mean = xt + batch_mul(step_size, grad_xt)
+      xt = xt_mean + batch_mul(noise, jnp.sqrt(step_size * 2))
+      return rng, xt[:,:-1], xt_mean[:,:-1],xt[:,-1],xt_mean[:,-1]
+
+    _, x, x_mean,t,t_mean = jax.lax.fori_loop(0, n_steps, loop_body, (rng, x, x,t,t))
+    return x, x_mean,t,t_mean
+
+
+
+
 
 
 
@@ -578,61 +700,183 @@ def get_ode_sampler(sde, model, shape, inverse_scaler,
   return ode_sampler
 
 
+#### Joint sampling ------------------------------------------------------------------------------------------
 
 
 
-#### Metropolis sampling 
+def get_joint_update(config,sde, model, shape, inverse_scaler,scaler, eps,integration_method='exact',hutchinson_type = 'Rademacher'): 
+  
+  """Create a joint sampler based on the predictor-corrector (PC) sampler.
+
+  """
+  denoise=config.sampling.noise_removal
+  predictor_warmup = get_predictor(config.sampling.predictor.lower())
+  #TODO have these as different correctors and predictors
+  corrector_joint = get_corrector('langevin_time_exact') 
+  corrector=get_corrector(config.sampling.corrector.lower())
+  # Create predictor & corrector update functions
+  predictor_update_fn_final = functools.partial(shared_predictor_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          predictor=predictor_warmup,
+                                          probability_flow=config.sampling.probability_flow,
+                                          continuous=config.training.continuous)
+
+
+  corrector_update_fn_final = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          corrector=corrector,
+                                          continuous=config.training.continuous,
+                                          snr=config.sampling.snr,
+                                          n_steps=config.sampling.n_steps_joint)
+  
+  corrector_update_joint = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          corrector=corrector_joint,
+                                          continuous=config.training.continuous,
+                                          snr=config.sampling.snr,
+                                          n_steps=config.sampling.n_steps_joint)
+
+  def joint_update(prng, pstate,samples):
+    """ The jint update.
+
+    Args:
+      rng: A JAX random state
+      state: A `flax.struct.dataclass` object that represents the training state of a score-based model.
+    Returns:
+      Samples, number of function evaluations
+    """
+
+    #prng
+    rng = (prng)
+    # Initial sample
+    x = scaler(samples)
+    #initial timesteps
+    timesteps = jnp.linspace(sde.T, eps, sde.N)
+    t=eps
+    vec_t_initial = jnp.ones(shape[0]) * t
+    shape_vmap=(1,shape[1])
+    rng, step_rng = random.split(rng) 
+    n_samples=config.sampling.per_chain_samples
+
+    #update algorithm
+
+    def joint_update(carry,i):
+      rng, x, x_mean, vec_t,x_list,x_mean_list,vec_t_list = carry
+      rng, step_rng = random.split(rng)
+      x_new, x_mean_new,v_t_new,v_t_mean_new =corrector_update_joint(step_rng, pstate, x, vec_t)
+      v_t_new, v_t_mean_new = jnp.clip(v_t_new, eps, sde.T), jnp.clip(v_t_mean_new, eps, sde.T)
+      rng, step_rng = random.split(rng)     
+
+      x_list = x_list.at[i].set(x_new)
+      x_mean_list = x_mean_list.at[i].set(x_mean_new)
+      vec_t_list = vec_t_list.at[i].set(v_t_new)
+      return (rng, x_new, x_mean_new, v_t_new,x_list,x_mean_list,vec_t_list), None
+
+    #set the list
+    x_list = jnp.zeros((n_samples,shape[0], shape[1]))   # Shape (batch_size, dims, n_samples)
+    x_mean_list = jnp.zeros((n_samples,shape[0], shape[1])) 
+    vec_t_list = jnp.zeros((n_samples,shape[0])) 
+    
+    carry=rng, x, x, vec_t_initial,x_list,x_mean_list,vec_t_list
+    final_carry, _ = jax.lax.scan(joint_update, carry, jnp.arange(n_samples))
+    rng, x, x_mean, vec_t,x_list,x_mean_list,vec_t_list = final_carry
+
+    x,x_mean,vec_t=x_list.reshape(-1,shape[-1]), x_mean_list.reshape(-1,shape[-1]), vec_t_list.flatten()
+    timesteps = jax.vmap(lambda t: jnp.linspace(t, eps, sde.N // 100))(vec_t).T
+    #warmup stage
+    def loop_body_final(i, val):
+      rng, x, x_mean = val
+      vec_t = timesteps[i] #this needs to be made a vector!
+
+      rng, step_rng = random.split(rng)
+      x, x_mean = predictor_update_fn_final(step_rng, pstate, x, vec_t) # use the same predictor
+      rng, step_rng = random.split(rng)
+      x, x_mean=corrector_update_fn_final(step_rng, pstate, x, vec_t)
+      return rng, x, x_mean
+
+    
+
+    #rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_final, (rng, x, x_mean))
+    return jnp.concatenate([vec_t[:,None],inverse_scaler(x_mean if denoise else x)],-1), sde.N * (config.sampling.n_steps_each+config.sampling.per_chain_samples*config.sampling.n_steps_joint + 1)
+
+  return jax.pmap(joint_update, axis_name='batch')
 
 
 
-def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup,corrector, inverse_scaler, snr,
-                   n_steps=1, probability_flow=False, continuous=False,
-                   denoise=True, eps=1e-3,integration_method='exact',hutchinson_type = 'Rademacher',n_steps_metropolis=1): 
+
+
+
+#### Metropolis sampling ------------------------------------------------------------------------------------------
+
+
+def get_metropolis_update(config,sde, model,model_noise, shape, inverse_scaler,scaler, eps,integration_method='exact',hutchinson_type = 'Rademacher'): 
+  
   """Create a metropolis sampler based on the predictor-corrector (PC) sampler.
 
-  Args:
-    sde: An `sde_lib.SDE` object representing the forward SDE.
-    model: A `flax.linen.Module` object that represents the architecture of a time-dependent score-based model.
-    shape: A sequence of integers. The expected shape of a single sample.
-    predictor_warmup: A subclass of `sampling.Predictor` representing the predictor algorithm.
-    corrector_warmup: A subclass of `sampling.Corrector` representing the corrector algorithm.
-    inverse_scaler: The inverse data normalizer.
-    snr: A `float` number. The signal-to-noise ratio for configuring correctors.
-    n_steps: An integer. The number of corrector steps per predictor update.
-    probability_flow: If `True`, solve the reverse-time probability flow ODE when running the predictor.
-    continuous: `True` indicates that the score model was continuously trained.
-    denoise: If `True`, add one-step denoising to the final samples.
-    eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
-
-  Returns:
-    A sampling function that takes random states, and a replcated training state and returns samples as well as
-    the number of function evaluations during sampling.
   """
+  denoise=config.sampling.noise_removal
+  predictor_warmup = get_predictor(config.sampling.predictor.lower())
+  #TODO have these as different correctors and predictors
+  corrector = get_corrector(config.sampling.corrector.lower()) 
   # Create predictor & corrector update functions
   predictor_update_fn_warmpup = functools.partial(shared_predictor_update_fn,
                                           sde=sde,
                                           model=model,
                                           predictor=predictor_warmup,
-                                          probability_flow=probability_flow,
-                                          continuous=continuous)
-  corrector_update_fn_warmup = functools.partial(shared_corrector_update_fn,
-                                          sde=sde,
-                                          model=model,
-                                          corrector=corrector_warmup,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps)
+                                          probability_flow=config.sampling.probability_flow,
+                                          continuous=config.training.continuous)
+
   
   corrector_update_fn_metropolis = functools.partial(shared_corrector_update_fn,
                                           sde=sde,
                                           model=model,
                                           corrector=corrector,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps_metropolis)
+                                          continuous=config.training.continuous,
+                                          snr=config.sampling.snr,
+                                          n_steps=config.sampling.n_steps_metropolis)
   #this is different at the moment because in future we will have other distributions
+  def noise_foward(x,noise_state):
+    variables = {'params': noise_state.params, **noise_state.model_state}
+    return model_noise.apply(variables, x, train=False, mutable=False)
+ 
 
-  def metropolis_sampler(rng, state):
+  #@jax.pmap
+  def drift_fn(state, x, t):
+    """The drift function of the reverse-time SDE."""
+    score_fn = mutils.get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
+    # Probability flow ODE is a special case of Reverse SDE
+    rsde = sde.reverse(score_fn, probability_flow=True)
+
+    return (rsde.sde)(x, t)[0]
+  if(integration_method=='estimate'):
+    #@jax.pmap
+    def div_fn(state, x, t, eps):
+      """Pmapped divergence of the drift function."""
+      div_fn = get_div_fn(lambda x, t: drift_fn(state, x, t))
+      return div_fn(x, t, eps)
+    if hutchinson_type == 'Gaussian':
+      rng, step_rng = random.split(rng)
+      epsilon = jax.random.normal(step_rng, shape)
+    elif hutchinson_type == 'Rademacher':
+      rng, step_rng = random.split(rng)
+      epsilon = jax.random.randint(step_rng, shape,                          
+                                        minval=0, maxval=2).astype(jnp.float32) * 2 - 1
+    else:
+      raise NotImplementedError(f"Hutchinson type {hutchinson_type} unknown.")
+  elif(integration_method=='exact'):
+    epsilon=None
+    #@jax.pmap
+    def div_fn(state, x, t,eps):
+      """Pmapped divergence of the drift function."""
+      div_fn = get_div_fn_exact(lambda x, t: drift_fn(state, x, t))
+      return div_fn(x, t, eps)
+  else:
+    raise NotImplementedError(f"Method of integration {integration_method} unknown.")     
+
+  def metropolis_update(prng, pstate,pstate_noise,samples):
     """ The PC sampler funciton.
 
     Args:
@@ -641,118 +885,61 @@ def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup
     Returns:
       Samples, number of function evaluations
     """
-    #likelihood terms
-    def drift_fn(state, x, t):
-      """The drift function of the reverse-time SDE."""
-      score_fn = mutils.get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
-      # Probability flow ODE is a special case of Reverse SDE
-      rsde = sde.reverse(score_fn, probability_flow=True)
 
-      return (rsde.sde)(x, t)[0]
+    #prng
+    rng = (prng)
 
-    if(integration_method=='estimate'):
-      #@jax.pmap
-      def div_fn(state, x, t, eps):
-        """Pmapped divergence of the drift function."""
-        div_fn = get_div_fn(lambda x, t: drift_fn(state, x, t))
-        return div_fn(x, t, eps)
-    elif(integration_method=='exact'):
-      #@jax.pmap
-      def div_fn(state, x, t,eps):
-        """Pmapped divergence of the drift function."""
-        div_fn = get_div_fn_exact(lambda x, t: drift_fn(state, x, t))
-        return div_fn(x, t, eps)
-    else:
-      raise NotImplementedError(f"Method of integration {integration_method} unknown.")     
-
-    #p_drift_fn = jax.pmap(drift_fn)  # Pmapped drift function of the reverse-time SDE
-    #p_prior_logp_fn = jax.pmap(sde.prior_logp)  # Pmapped log-PDF of the SDE's prior distribution
-      
-
-
-    
     # Initial sample
-    rng, step_rng = random.split(rng)
-    x = sde.prior_sampling(step_rng, shape)
+    x = scaler(samples)
+    #initial timesteps
     timesteps = jnp.linspace(sde.T, eps, sde.N)
-
-
-
-
-
-    #warmup stage
-    def loop_body_warmup(i, val):
-      rng, x, x_mean = val
-      t = timesteps[i]
-      vec_t = jnp.ones(shape[0]) * t
-      rng, step_rng = random.split(rng)
-      x, x_mean = corrector_update_fn_warmup(step_rng, state, x, vec_t)
-      rng, step_rng = random.split(rng)
-      x, x_mean = predictor_update_fn_warmpup(step_rng, state, x, vec_t)
-      return rng, x, x_mean
-
-    rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_warmup, (rng, x, x))
     t=eps
-    # Denoising is equivalent to running one predictor step without adding noise.
-    #r
-    rng, step_rng = jax.random.split((rng))
-    if hutchinson_type == 'Gaussian':
-      epsilon = jax.random.normal(step_rng, shape)
-    elif hutchinson_type == 'Rademacher':
-      epsilon = jax.random.randint(step_rng, shape,
-                                 minval=0, maxval=2).astype(jnp.float32) * 2 - 1
-    else:
-      raise NotImplementedError(f"Hutchinson type {hutchinson_type} unknown.")
-    solver = diffrax.Tsit5()  # Equivalent to RK45
-
-
-
-
-    shape_vmap=(1,shape[1])
-    def ode_func(t, x,args):
-
-      # x should be shape (n_dims,)
-      # t should be shape ()
-      sample = x.reshape(shape_vmap)
-      vec_t = jnp.ones(shape_vmap[0]) * t
-      drift = drift_fn(state, sample, vec_t)
-
- 
-      drift = mutils.to_flattened_numpy(drift_fn(state, sample, vec_t))
-      logp_grad = mutils.to_flattened_numpy(div_fn(state, sample, vec_t, epsilon))
-
-      zp = jnp.concatenate([drift, logp_grad], axis=0)
-      z = mutils.from_flattened_numpy(drift, shape_vmap)
-      delta_logp = logp_grad.sum()
-      prior_logp = (sde.prior_logp)(z)
-      l_hood_new = -(prior_logp + delta_logp)-jnp.log(sde.marginal_prob(jnp.zeros_like(x), vec_t)[1]) 
-      return jnp.concatenate([l_hood_new,l_hood_new],axis=0)  
     
+    vec_t_initial = jnp.ones(shape[0]) * t
+    shape_vmap=(1,shape[1])
 
-    v_t = jnp.ones(shape[0]) * t
+    ######### Integration setup!
+    solver = diffrax.Tsit5() 
+    stepsize_controller = diffrax.PIDController(rtol=1e-5, atol=1e-5)
 
-    def loop_body_metropolis(i, val):
-      # so what i need too do in this is to check the code for the noise and for the metropolis sampling particualrly for t
-      rng, x, x_mean, vec_t, l_hood = val
-      assert vec_t.shape[0]==shape[0]
-      v_t_new=vec_t#NOISE_NET(x) # gibbs sampling t~q(t|x)
-      rng, step_rng = random.split(rng)
+    def ode_func(t, x,args):
+    # x should be shape (n_dims,)
+      # t should be shape ()
+        sample = x.reshape(shape_vmap)
+        vec_t = jnp.ones(shape_vmap[0]) * t
+        drift = drift_fn(pstate, sample, vec_t)
+        div=div_fn(pstate, sample, vec_t, epsilon)
+        prior_sigma=jnp.log(sde.marginal_prob(jnp.zeros_like(x), vec_t)[1]) #p(sigma) propto 1/sigma
+  
+        drift = mutils.to_flattened_numpy(drift)
+        logp_grad = mutils.to_flattened_numpy(div)
 
-      x_new, x_mean_new = corrector_update_fn_metropolis(step_rng, state, x, v_t_new)
+        z = mutils.from_flattened_numpy(drift, shape_vmap)
+        delta_logp = logp_grad.sum()
+        prior_logp = (sde.prior_logp)(z)
+        l_hood_new = (prior_logp + delta_logp)-prior_sigma 
+        return jnp.concatenate([l_hood_new,l_hood_new],axis=0)  # Concatenate to match the shape of x
 
-      rng, step_rng = random.split(rng)
-      def solve_ode(inputs):
-        t1, x_batch = inputs[0], inputs[1:]
+    def ode_func(t, x,args):
+      sample = x[:-shape_vmap[0] * shape_vmap[1]].reshape(shape_vmap)
+      vec_t =  jnp.ones(shape_vmap[0]) * t
+      drift = drift_fn(pstate, sample, vec_t)
+      logp_grad=div_fn(pstate, sample, vec_t, epsilon)
+      drift = mutils.to_flattened_numpy(drift)
+      logp_grad = mutils.to_flattened_numpy(logp_grad)
 
-        init = mutils.to_flattened_numpy(x_batch)
+      return jnp.concatenate([drift, logp_grad], axis=0)
+     
 
-        #init is the concatenated x and the zeros
-        
-        t0=sde.T
-        dt0 = t1 - sde.T # Automatic initial step size
+
+    term=diffrax.ODETerm(ode_func)
+
+    def solve_ode(inputs):
+        t0, x_batch = inputs[0], inputs[1:]
+        init=jnp.concatenate([mutils.to_flattened_numpy(x_batch), jnp.zeros((shape_vmap[1],))], axis=0)
+        t1=sde.T
+        dt0 = t1 - t0 # Automatic initial step size
         saveat = diffrax.SaveAt(ts=[t1])  # Save only final time 
-        term=diffrax.ODETerm(ode_func)
-        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-5)
         solution = diffrax.diffeqsolve(
           term,
           solver,
@@ -763,36 +950,79 @@ def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup
           saveat=saveat,
           stepsize_controller=stepsize_controller
         )
+        zp = jax.lax.stop_gradient(jnp.asarray(solution.ys[0]))
+        z = mutils.from_flattened_numpy(zp[:-shape_vmap[0] * shape_vmap[1]], shape_vmap)
+        delta_logp = (zp[-shape_vmap[0] * shape_vmap[1]:].reshape((shape_vmap[0], shape_vmap[1]))).sum(-1)
+        prior_logp = sde.prior_logp(z)
+ 
+        prior_sigma=jnp.log(sde.marginal_prob(jnp.zeros_like(x), jnp.ones(shape_vmap[0])*t0)[1]) #p(sigma) propto 1/sigma
 
-        return solution.ys[0]
-      # Extract results
-      batch_size = shape[0]
-      t0 = sde.T*jnp.ones(shape[0])
-      t1 = v_t_new
-      batched_solve = jax.vmap(solve_ode)
-      inputs=jnp.concatenate([t1.reshape(-1,1),x_new],axis=1)
-      solutions = batched_solve(inputs)
-      l_hood_new = jnp.asarray(solutions)[:,0]
+        likelihood_value = (prior_logp + delta_logp)#-prior_sigma ##-prior_sigma / jnp.log(2) #we dont use bits/dim here
+        #technically the likelihood is off by a constant from the inv scalar, but we dont care about that because we only care about difference of log likelihood
+        include_scaler_trasnform=False
+        if(include_scaler_trasnform==True):
+          likelihood_value = likelihood_value + jnp.log(jnp.abs(jnp.linalg.det(jax.grad(inverse_scaler)(z))))
 
 
+        return likelihood_value  # Stop gradient to avoid backprop through ODE solver
+
+    ############
+    ### Get the likelihood of the original samples
+    ################
+      
+    
+    # fist step, evaluate the likelihood of the original points
+    batched_solve = eqx.filter_vmap(solve_ode)
+    inputs_intial=jnp.concatenate([vec_t_initial.reshape(-1,1),x],axis=1)
+    solutions_initial = batched_solve(inputs_intial)
+    l_hood_inital = jnp.asarray(solutions_initial)[:,0]
+    
+    
+    rng, step_rng = random.split(rng) 
+
+    ###### metropolis step
+    ######### Metropolis loop!
+    n_samples=config.sampling.per_chain_samples
+ 
+
+    def loop_body_metropolis(carry,i):
+      rng, x, x_mean, vec_t, l_hood,x_list,x_mean_list,vec_t_list = carry
+      rng, step_rng = random.split(rng)
+
+      v_t_new=div_fn(pstate, x, vec_t, epsilon)
+      rng, step_rng = random.split(rng)
+      x_new, x_mean_new =corrector_update_fn_metropolis(step_rng, pstate, x, v_t_new)
+      rng, step_rng = random.split(rng)     
+    
+      #batched_solve = eqx.filter_vmap(solve_ode)
+      #inputs=jnp.concatenate([v_t_new.reshape(-1,1),x_new],axis=1)
+      #solutions = batched_solve(inputs)
+      #l_hood_new = jnp.asarray(solutions)[:,0]
+      l_hood_new=l_hood
       
       # Metropolis acceptance
-      accept = jnp.exp(l_hood_new - l_hood)
+      accept = 1#jnp.exp(l_hood_new - l_hood)
       rng, step_rng = random.split(rng)
       u = random.uniform(step_rng, (shape[0],))
-      mask = u < accept
+      mask = u <=accept
       x_new = jnp.where(mask[:, None], x_new, x)
       x_mean_new=jnp.where(mask[:, None], x_mean_new, x_mean)
       l_hood = jnp.where(mask, l_hood_new, l_hood)
-      vec_t = jnp.where(mask, v_t_new, vec_t)
+      v_t_new = jnp.where(mask, v_t_new, vec_t)
+      x_list = x_list.at[i].set(x_new)
+      x_mean_list = x_mean_list.at[i].set(x_mean_new)
+      vec_t_list = vec_t_list.at[i].set(v_t_new)
+      return (rng, x_new, x_mean_new, v_t_new, l_hood,x_list,x_mean_list,vec_t_list), None
 
-
-
-      return rng, x_new, x_mean_new, vec_t, l_hood
-    n_samples=10
-    rng, x, x_old_mean, vec_t,l_hood= jax.lax.fori_loop(0, n_samples, loop_body_metropolis, (rng, x, x_mean, v_t, jnp.ones(shape[0])*1e-10))
+    x_list = jnp.zeros((n_samples,shape[0], shape[1]))   # Shape (batch_size, dims, n_samples)
+    x_mean_list = jnp.zeros((n_samples,shape[0], shape[1])) 
+    vec_t_list = jnp.zeros((n_samples,shape[0])) 
     
+    carry=rng, x, x, vec_t_initial, l_hood_inital,x_list,x_mean_list,vec_t_list
+    final_carry, _ = jax.lax.scan(loop_body_metropolis, carry, jnp.arange(n_samples))
+    rng, x, x_mean, vec_t, l_hood,x_list,x_mean_list,vec_t_list = final_carry
 
+    x,x_mean,vec_t=x_list.reshape(-1,shape[-1]), x_mean_list.reshape(-1,shape[-1]), vec_t_list.flatten()
     timesteps = jax.vmap(lambda t: jnp.linspace(t, eps, sde.N // 100))(vec_t).T
     #warmup stage
     def loop_body_final(i, val):
@@ -800,22 +1030,18 @@ def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup
       vec_t = timesteps[i] #this needs to be made a vector!
 
       rng, step_rng = random.split(rng)
-      x, x_mean = predictor_update_fn_warmpup(step_rng, state, x, vec_t) # use the same predictor
+      x, x_mean = predictor_update_fn_warmpup(step_rng, pstate, x, vec_t) # use the same predictor
+      rng, step_rng = random.split(rng)
+      x, x_mean=corrector_update_fn_metropolis(step_rng, pstate, x, vec_t)
       return rng, x, x_mean
     # Metropolis sampling
-    rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_final, (rng, x, x_old_mean))
-    # final t=eps
-    return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
 
-  return jax.pmap(metropolis_sampler, axis_name='batch')
+    
 
+    #rng, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body_final, (rng, x, x_mean))
+    return jnp.concatenate([vec_t[:,None],inverse_scaler(x_mean if denoise else x)],-1), sde.N * (config.sampling.n_steps_each+config.sampling.per_chain_samples*config.sampling.n_steps_metropolis + 1)
 
-
-
-
-
-
-
+  return jax.pmap(metropolis_update, axis_name='batch')
 
 
 
@@ -823,7 +1049,7 @@ def get_metropolis_sampler(sde, model, shape, predictor_warmup, corrector_warmup
 #### utils for the metropolis
 
 def get_div_fn(fn):
-  """Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator."""
+  """Create the divergence function of `fn`x using the Hutchinson-Skilling trace estimator."""
   ## Forward-mode differentiation (faster)
   def div_fn(x, t, eps):
       jvp = jax.jvp(lambda x: fn(x, t), (x,), (eps,))[1]
@@ -836,7 +1062,10 @@ def get_div_fn_exact(fn):
     def div_fn(x, t,eps=None):
 
         # Compute per-sample Jacobian, ensuring differentiation is only w.r.t x
+
         jacobian = jax.vmap(jax.jacfwd(fn,argnums=0))(x, t[:,None])  # Differentiate w.r.t. x only
-        return jnp.trace(jacobian, axis1=-2, axis2=-1)  # Take trace over last two axes
+        
+        return jnp.diagonal(jacobian, axis1=-2, axis2=-1)  # Return the diagonal along the last two axes
 
     return div_fn
+

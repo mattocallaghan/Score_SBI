@@ -139,10 +139,10 @@ def get_noise_model_fn(model, params, states, train=False):
 @jax.jit
 def sample_joint(x, sigma_max, sigma_min,rng,ts):
     rng2,rng3 = jax.random.split(rng,2)
-
+    #need to update for other models
     ss = sigma_min * (sigma_max / sigma_min) ** ts
     y = jax.random.randint(rng2, (1,), 0, len(ts))
     
     x = x + ss[y] * jax.random.normal(rng3, x.shape)
 
-    return x,y
+    return x,y #should be always positive

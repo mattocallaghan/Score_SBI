@@ -139,9 +139,9 @@ def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
 
 
     solver = diffrax.Tsit5()  # Equivalent to RK45
-    t0 = sde.T
-    t1 = eps
-    dt0 = eps - sde.T # Automatic initial step size
+    t0 = eps
+    t1 = sde.T
+    dt0 = t1 - t0 # Automatic initial step size
     saveat = diffrax.SaveAt(ts=[t1])  # Save only final time 
 
 
@@ -164,14 +164,18 @@ def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
     z = mutils.from_flattened_numpy(zp[:-shape[0] * shape[1]], shape)
     delta_logp = zp[-shape[0] * shape[1]:].reshape((shape[0], shape[1]))
     prior_logp = p_prior_logp_fn(z)
-    bpd = -(prior_logp + delta_logp) #/ jnp.log(2)
+    likelihood_value = (prior_logp + delta_logp) #/ jnp.log(2) #we dont use bits/dim here
+    #technically the likelihood is off by a constant from the inv scalar, but we dont care about that because we only care about difference of log likelihood
+    include_scaler_trasnform=False
+    if(include_scaler_trasnform==True):
+      likelihood_value = likelihood_value + jnp.log(jnp.abs(jnp.linalg.det(jax.grad(inverse_scaler)(z))))
     #N = jnp.prod(jnp.array(shape[2:]))
     #bpd = bpd / N
     # A hack to convert log-likelihoods to bits/dim
     # based on the gradient of the inverse data normalizer.
     #offset = jnp.log2(jax.grad(inverse_scaler)(0.)) + 8.
     #bpd += offset
-    return bpd, z, nfe
+    return likelihood_value, z, nfe
 
 
 

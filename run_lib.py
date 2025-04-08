@@ -263,8 +263,20 @@ def evaluate(config, workdir, eval_folder="eval"):
                        ema_rate=config.model.ema_rate,params=initial_params,
                        params_ema=initial_params,
                        rng=rng)  # pytype: disable=wrong-keyword-args
+  
+  # initialize noise model 
+  rng, step_rng = jax.random.split(rng)
+  noise_model, init_noise_model_state, initial_params_noise = nmutils.init_noise_model(step_rng, config)
+  optimizer_noise, optimize_fn_noise = losses.get_optimizer(config)
+  state_noise = nmutils.NoiseState(step=0, opt_state=optimizer_noise.init(initial_params_noise), lr=config.optim.lr,
+                       model_state=init_noise_model_state,
+                       ema_rate=config.model.ema_rate,params=initial_params_noise,
+                       params_ema=initial_params_noise,
+                       rng=rng)  # pytype: disable=wrong-keyword-args
+
 
   checkpoint_dir = os.path.join(workdir, "checkpoints")
+  checkpoint_dir_noise = os.path.join(workdir, "checkpoints_noise")
 
   # Setup SDE.
   if config.training.sde.lower() == 'vpsde':
@@ -381,6 +393,20 @@ def evaluate(config, workdir, eval_folder="eval"):
         time.sleep(60)
     pstate = flax.jax_utils.replicate(state)
 
+
+    ckpt_filename_noise = os.path.join(checkpoint_dir_noise, f"checkpoint_{ckpt}")
+    while not tf.io.gfile.exists(ckpt_filename_noise):
+      logging.warning("Waiting for checkpoint_%d ..." % (ckpt,))
+      time.sleep(60)
+
+    for _ in range(3):
+      try:
+        state_noise = checkpoints.restore_checkpoint(checkpoint_dir_noise, state_noise, step=ckpt)
+        break
+      except Exception:
+        time.sleep(60)
+    pstate_noise = flax.jax_utils.replicate(state_noise)
+
     # Evaluate loss on the full evaluation dataset (if enabled).
     if config.eval.enable_loss:
       all_losses = []
@@ -454,34 +480,43 @@ def evaluate(config, workdir, eval_folder="eval"):
           prefix=f"meta_{jax.host_id()}_")
       except Exception as e:
         print(f"An error occurred while saving the checkpoint: {e}")
-      
-
+    if(config.sampling.joint==True):
+      joint_update = sampling.get_joint_update(config=config, sde=sde, model=score_model,shape=sampling_shape,
+                                                         inverse_scaler= inverse_scaler, scaler=scaler,eps=sampling_eps)
 
     # Sampling: generate and save vector samples.
     if config.eval.enable_sampling:
       state = jax.device_put(state)
+      state_noise = jax.device_put(state_noise)
 
       for r in range(begin_sampling_round, num_sampling_rounds):
         if jax.host_id() == 0:
           logging.info("sampling -- ckpt: %d, round: %d" % (ckpt, r))
         rng, *sample_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
         sample_rng = jnp.asarray(sample_rng)
-        samples, _ = equinox.filter_jit(sampling_fn)(sample_rng, pstate)
-        # Save raw vector samples.
+
+        if(config.sampling.joint==False):
+          samples, _ =(sampling_fn)(sample_rng, pstate)
+          # Save raw vector samples
+        elif(config.sampling.joint==True): 
+          samples, _ =(sampling_fn)(sample_rng, pstate)
+          rng, *sample_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
+          sample_rng = jnp.asarray(sample_rng)
+          samples, _ =joint_update(sample_rng,pstate,samples)
+        else:
+          raise NotImplementedError(f"Sampling joint {config.sampling.joint} not T/F.")
+        
+        
+        
         this_sample_dir = os.path.join(
-          eval_dir, f"ckpt_{ckpt}_host_{jax.host_id()}")
+            eval_dir, f"ckpt_{ckpt}_host_{jax.host_id()}")
         tf.io.gfile.makedirs(this_sample_dir)
-        logging.info("Warning Clearning Backend!")
-        jax.clear_backends()
-
-
 
         sample_save_path = os.path.join(this_sample_dir, f"samples_{r}.npz")
         with tf.io.gfile.GFile(sample_save_path, "wb") as fout:
           io_buffer = io.BytesIO()
           np.savez_compressed(io_buffer, samples=samples)
           fout.write(io_buffer.getvalue())
-        gc.collect()
         logging.info("Checkpoint %d: saved sampling round %d." % (ckpt, r))
 
         def clear_memory(x):

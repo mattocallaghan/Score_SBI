@@ -71,7 +71,9 @@ def get_config():
     config.sampling.snr = 0.16
     config.sampling.n_steps_each = 1
     config.sampling.probability_flow = False
-    config.sampling.n_steps_metropolis=1
+    config.sampling.n_steps_joint=1
+    config.sampling.joint=True
+    config.sampling.per_chain_samples=1
 
     config.noise_model = ConfigDict()
     config.noise_model.name='simple_noise'

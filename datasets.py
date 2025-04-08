@@ -171,6 +171,7 @@ def preprocess_and_batch(dataset, batch_dims, config, evaluation, uniform_dequan
     for batch_size in reversed(batch_dims):
       dataset = dataset.batch(batch_size, drop_remainder=True)
     #dataset = dataset.batch(batch_dims[-1], drop_remainder=True)
+    dataset = dataset.shuffle(buffer_size=10000)
     return dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
 
@@ -245,7 +246,7 @@ def load_custom_dataset_noise(dataset_name, config):
     
     rng = jax.random.PRNGKey(0)
     rngs = jax.random.split(rng, data.shape[0])
-    sample_joint_vmap = jax.vmap(lambda d, r: sample_joint(d, config.model.sigma_max, config.model.sigma_min, r, jnp.linspace(1.0, 1e-3,config.model.num_scales)))
+    sample_joint_vmap = jax.vmap(lambda d, r: sample_joint(d, config.model.sigma_max, config.model.sigma_min, r, jnp.linspace(1.0, 1e-5,config.model.num_scales)))
     x, y = sample_joint_vmap(data, rngs)
     dataset = tf.data.Dataset.from_tensor_slices({"data": x,'labels':y})
     

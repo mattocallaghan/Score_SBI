@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import ml_collections
 import jax
 import models.nutils as nutils
+from models.layerspp import GaussianFourierProjection
 
 @nutils.register_noise_model(name='simple_noise')
 class register_noise_model(nn.Module):
@@ -14,10 +15,9 @@ class register_noise_model(nn.Module):
         N = config.model.num_scales
         hidden_size = self.config.noise_model.hidden_size
 
-
-        x = nn.relu(nn.Dense(hidden_size)(x))
+        x = nn.sigmoid(nn.Dense(10)(x))
         x = nn.Dropout(dropout)(x, deterministic=not train)
-        x = nn.relu(nn.Dense(hidden_size)(x))
-        x = nn.Dense(N)(x)
+
+        x=(nn.Dense(N)(x))        
         return x
 

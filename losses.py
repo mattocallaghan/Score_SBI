@@ -277,8 +277,11 @@ def get_noise_loss_fn(noise_model, train):
     data = batch['data']
     labels = batch['labels'][:, 0]
     output, new_model_state = noise_net(data, rng=step_rng)
+    log_probs = jax.nn.log_softmax(output)  # Add epsilon for numerical stability
+    one_hot_labels = jax.nn.one_hot(labels, num_classes=output.shape[-1])  # Convert labels to one-hot
 
-    return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(output, labels)), new_model_state
+    loss = -jnp.sum(one_hot_labels * log_probs, axis=-1)  # Per-sample loss
+    return jnp.mean(loss), new_model_state  # Mean loss over batch
 
   return noise_loss_fn
 

@@ -101,7 +101,7 @@ def score_plot(config, workdir, eval_folder="eval"):
 
   if True:
     likelihood_fn = likelihood.get_likelihood_fn(sde, score_model, inverse_scaler
-                                                 ,how=config.eval.integration_method,hutchinson_type=config.eval.hutchinson)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
+                                                 ,how=config.eval.integration_method,hutchinson_type=config.eval.hutchinson,eps=1e-5)#,num_repeats=5 if config.eval.bpd_dataset.lower() == "test" else 1,)
 
   # Build the sampling function.
 
