@@ -20,7 +20,6 @@ from flax.metrics import tensorboard
 from flax.training import checkpoints
 # Keep the import below for registering all model definitions
 from models import simple_score
-from models import noise_class
 import losses
 import sampling
 import utils
@@ -124,7 +123,7 @@ def score_plot(config, workdir, eval_folder="eval"):
     begin_ckpt = eval_meta.ckpt_id
     begin_bpd_round = eval_meta.bpd_round_id + 1
   else:
-    begin_ckpt = eval_meta.ckpt_id + 1
+    begin_ckpt = eval_meta.ckpt_id 
     begin_bpd_round = 0
 
   rng = eval_meta.rng
@@ -132,6 +131,8 @@ def score_plot(config, workdir, eval_folder="eval"):
   logging.info("Starting evaluation from checkpoint: %d" % (begin_ckpt,))
 
   # Evaluate each checkpoint.
+  print('here')
+
   for ckpt in range(begin_ckpt, config.eval.end_ckpt+1):
     ckpt_filename = os.path.join(checkpoint_dir, f"checkpoint_{ckpt}")
     while not tf.io.gfile.exists(ckpt_filename):
@@ -152,10 +153,10 @@ def score_plot(config, workdir, eval_folder="eval"):
       bpds = []
       ds=[]
       gradients=[]
-      begin_repeat_id = begin_bpd_round // len(ds_bpd)
-      begin_batch_id = begin_bpd_round % len(ds_bpd)
+      begin_repeat_id = 0
+      begin_batch_id = 1
       # Repeat multiple times to reduce variance when needed
-      for repeat in range(begin_repeat_id, bpd_num_repeats):
+      for repeat in range(0, 5):
         bpd_iter = iter(ds_bpd)
 
         for _ in range(begin_batch_id):
@@ -290,4 +291,5 @@ def score_plot(config, workdir, eval_folder="eval"):
       # Save the plot
       plt.savefig(os.path.join(eval_dir,
         f"{config.eval.bpd_dataset}_ckpt_{ckpt}_likelihood_gradients_plot.png"), dpi=300)
+      plt.show()
       plt.close()

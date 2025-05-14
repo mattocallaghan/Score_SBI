@@ -60,17 +60,17 @@ class SimpleScoreNet(nn.Module):
             time_emb=None
             used_sigmas=time_cond
             
+        if(conditional):
+                time_emb = nn.Dense(4*nf, name=f'time_embedding_dense_init',use_bias=False)(time_emb)
+                time_emb = nn.Dense(time_dense_size, name=f'time_embedding_dense_1',use_bias=False)(act(time_emb))
 
-            
-        h=x
+        h=jnp.concatenate([x, time_emb], axis=-1) if conditional else x
+
         for i in range(num_layers - 1):
             h = nn.Dense(hidden_size, name=f'hidden_dense_{i}',use_bias=True)(h)
             h = nn.Dropout(dropout)(h, deterministic=not train)
             h = act(h)
-            if(conditional):
-                time_emb = nn.Dense(hidden_size, name=f'time_embedding_dense_{i}',use_bias=False)(time_emb)
-                time_emb = act(time_emb)
-                h+=time_emb
+
 
 
         out = nn.Dense(x.shape[-1],name='output_dense',use_bias=True)(h)

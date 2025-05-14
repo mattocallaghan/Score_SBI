@@ -10,7 +10,7 @@ def get_config():
     # Training settings.
     config.training = ConfigDict()
     config.training.batch_size = 64
-    config.training.n_iters = 20000           # Total number of training iterations.
+    config.training.n_iters = 25000           # Total number of training iterations.
     config.training.n_jitted_steps = 5         # Number of steps jitted together.
     config.training.log_freq = 20        # Log frequency (must be divisible by n_jitted_steps).
     config.training.snapshot_freq_for_preemption = 20
@@ -46,7 +46,7 @@ def get_config():
     # Model settings.
     config.model = ConfigDict()
     config.model.ema_rate = 0.999
-    config.model.num_scales = 1000              # Number of discretization steps for the SDE.
+    config.model.num_scales = 500              # Number of discretization steps for the SDE.
     config.model.beta_min = 0.1                 # For VPSDE / subVPSDE.
     config.model.beta_max = 20.0                # For VPSDE / subVPSDE.
     config.model.sigma_min = 0.01               # For VESDE.

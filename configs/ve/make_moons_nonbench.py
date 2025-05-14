@@ -12,11 +12,11 @@ def get_config():
     config.model.name='simple_score'
     
     config.model.nf = 4
-    config.model.dropout=0.00
+    config.model.dropout=0.10
     # Whether to condition on the noise level/time (set to True for a conditional score model).
     config.model.conditional = True  
     # The hidden layer size in the network.
-    config.model.hidden_size = 250  
+    config.model.hidden_size = 50  
     # The number of fully-connected layers (excluding the output layer).
     config.model.num_layers = 5  
     # Scale factor for Gaussian Fourier features.
@@ -36,14 +36,14 @@ def get_config():
     # For sbibm-based tasks (if used):
     config.data.benchmark = True       # A task name available in SBIBM.
 
-    config.sampling.noise_removal = False         # Whether to perform a final denoising step.
+    config.sampling.noise_removal = True         # Whether to perform a final denoising step.
 
-    config.eval.begin_ckpt = 20                  # Starting checkpoint index.
+    config.eval.begin_ckpt = 19                  # Starting checkpoint index.
     config.eval.end_ckpt = 20
     config.eval.grid_points=100
     config.sampling.n_steps_joint=3 ##how many skips in the metropolis step
     config.sampling.per_chain_samples=100000
-    config.eval.batch_size=20000
+    config.eval.batch_size=2000
     config.eval.num_samples=1 #this doesnt seem to work without this 
     config.eval.integration_method='exact'
     config.eval.hutchinson='Rademacher'   #need to prepegate this
